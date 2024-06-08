@@ -1,7 +1,7 @@
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
-use crate::config_watcher::ServiceChange;
+use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
-use crate::helper::retry_notify_with_deadline;
+use crate::helper::{retry_notify_with_deadline, write_and_flush};
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
@@ -25,8 +25,10 @@ use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span}
 
 #[cfg(feature = "noise")]
 use crate::transport::NoiseTransport;
-#[cfg(feature = "tls")]
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
 use crate::transport::TlsTransport;
+#[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+use crate::transport::WebsocketTransport;
 
 type ServiceDigest = protocol::Digest; // SHA256 of a service name
 type Nonce = protocol::Digest; // Also called `session_key`
@@ -38,11 +40,11 @@ const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 
 // The entrypoint of running a server
 pub async fn run_server(
-    config: &Config,
+    config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
-    service_rx: mpsc::Receiver<ServiceChange>,
+    update_rx: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
-    let config = match &config.server {
+    let config = match config.server {
             Some(config) => config,
             None => {
                 return Err(anyhow!("Try to run as a server, but the configuration is missing. Please add the `[server]` block"))
@@ -52,25 +54,34 @@ pub async fn run_server(
     match config.transport.transport_type {
         TransportType::Tcp => {
             let mut server = Server::<TcpTransport>::from(config).await?;
-            server.run(shutdown_rx, service_rx).await?;
+            server.run(shutdown_rx, update_rx).await?;
         }
         TransportType::Tls => {
-            #[cfg(feature = "tls")]
+            #[cfg(any(feature = "native-tls", feature = "rustls"))]
             {
                 let mut server = Server::<TlsTransport>::from(config).await?;
-                server.run(shutdown_rx, service_rx).await?;
+                server.run(shutdown_rx, update_rx).await?;
             }
-            #[cfg(not(feature = "tls"))]
-            crate::helper::feature_not_compile("tls")
+            #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
+            crate::helper::feature_neither_compile("native-tls", "rustls")
         }
         TransportType::Noise => {
             #[cfg(feature = "noise")]
             {
                 let mut server = Server::<NoiseTransport>::from(config).await?;
-                server.run(shutdown_rx, service_rx).await?;
+                server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(feature = "noise"))]
             crate::helper::feature_not_compile("noise")
+        }
+        TransportType::Websocket => {
+            #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+            {
+                let mut server = Server::<WebsocketTransport>::from(config).await?;
+                server.run(shutdown_rx, update_rx).await?;
+            }
+            #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
+            crate::helper::feature_neither_compile("websocket-native-tls", "websocket-rustls")
         }
     }
 
@@ -82,9 +93,9 @@ pub async fn run_server(
 type ControlChannelMap<T> = MultiMap<ServiceDigest, Nonce, ControlChannelHandle<T>>;
 
 // Server holds all states of running a server
-struct Server<'a, T: Transport> {
+struct Server<T: Transport> {
     // `[server]` config
-    config: &'a ServerConfig,
+    config: Arc<ServerConfig>,
 
     // `[server.services]` config, indexed by ServiceDigest
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
@@ -105,14 +116,18 @@ fn generate_service_hashmap(
     ret
 }
 
-impl<'a, T: 'static + Transport> Server<'a, T> {
+impl<T: 'static + Transport> Server<T> {
     // Create a server from `[server]`
-    pub async fn from(config: &'a ServerConfig) -> Result<Server<'a, T>> {
+    pub async fn from(config: ServerConfig) -> Result<Server<T>> {
+        let config = Arc::new(config);
+        let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
+        let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
+        let transport = Arc::new(T::new(&config.transport)?);
         Ok(Server {
             config,
-            services: Arc::new(RwLock::new(generate_service_hashmap(config))),
-            control_channels: Arc::new(RwLock::new(ControlChannelMap::new())),
-            transport: Arc::new(T::new(&config.transport)?),
+            services,
+            control_channels,
+            transport,
         })
     }
 
@@ -120,7 +135,7 @@ impl<'a, T: 'static + Transport> Server<'a, T> {
     pub async fn run(
         &mut self,
         mut shutdown_rx: broadcast::Receiver<bool>,
-        mut service_rx: mpsc::Receiver<ServiceChange>,
+        mut update_rx: mpsc::Receiver<ConfigChange>,
     ) -> Result<()> {
         // Listen at `server.bind_addr`
         let l = self
@@ -171,8 +186,9 @@ impl<'a, T: 'static + Transport> Server<'a, T> {
                                         Ok(conn) => {
                                             let services = self.services.clone();
                                             let control_channels = self.control_channels.clone();
+                                            let server_config = self.config.clone();
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels).await {
+                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -193,7 +209,7 @@ impl<'a, T: 'static + Transport> Server<'a, T> {
                     info!("Shuting down gracefully...");
                     break;
                 },
-                e = service_rx.recv() => {
+                e = update_rx.recv() => {
                     if let Some(e) = e {
                         self.handle_hot_reload(e).await;
                     }
@@ -206,24 +222,26 @@ impl<'a, T: 'static + Transport> Server<'a, T> {
         Ok(())
     }
 
-    async fn handle_hot_reload(&mut self, e: ServiceChange) {
+    async fn handle_hot_reload(&mut self, e: ConfigChange) {
         match e {
-            ServiceChange::ServerAdd(s) => {
-                let hash = protocol::digest(s.name.as_bytes());
-                let mut wg = self.services.write().await;
-                let _ = wg.insert(hash, s);
+            ConfigChange::ServerChange(server_change) => match server_change {
+                ServerServiceChange::Add(cfg) => {
+                    let hash = protocol::digest(cfg.name.as_bytes());
+                    let mut wg = self.services.write().await;
+                    let _ = wg.insert(hash, cfg);
 
-                let mut wg = self.control_channels.write().await;
-                let _ = wg.remove1(&hash);
-            }
-            ServiceChange::ServerDelete(s) => {
-                let hash = protocol::digest(s.as_bytes());
-                let _ = self.services.write().await.remove(&hash);
+                    let mut wg = self.control_channels.write().await;
+                    let _ = wg.remove1(&hash);
+                }
+                ServerServiceChange::Delete(s) => {
+                    let hash = protocol::digest(s.as_bytes());
+                    let _ = self.services.write().await.remove(&hash);
 
-                let mut wg = self.control_channels.write().await;
-                let _ = wg.remove1(&hash);
-            }
-            _ => (),
+                    let mut wg = self.control_channels.write().await;
+                    let _ = wg.remove1(&hash);
+                }
+            },
+            ignored => warn!("Ignored {:?} since running as a server", ignored),
         }
     }
 }
@@ -233,12 +251,20 @@ async fn handle_connection<T: 'static + Transport>(
     mut conn: T::Stream,
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    server_config: Arc<ServerConfig>,
 ) -> Result<()> {
     // Read hello
     let hello = read_hello(&mut conn).await?;
     match hello {
         ControlChannelHello(_, service_digest) => {
-            do_control_channel_handshake(conn, services, control_channels, service_digest).await?;
+            do_control_channel_handshake(
+                conn,
+                services,
+                control_channels,
+                service_digest,
+                server_config,
+            )
+            .await?;
         }
         DataChannelHello(_, nonce) => {
             do_data_channel_handshake(conn, control_channels, nonce).await?;
@@ -252,6 +278,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     service_digest: ServiceDigest,
+    server_config: Arc<ServerConfig>,
 ) -> Result<()> {
     info!("Try to handshake a control channel");
 
@@ -276,7 +303,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         None => {
             conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
                 .await?;
-            bail!("No such a service {}", hex::encode(&service_digest));
+            bail!("No such a service {}", hex::encode(service_digest));
         }
     }
     .to_owned();
@@ -321,7 +348,8 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         conn.flush().await?;
 
         info!(service = %service_config.name, "Control channel established");
-        let handle = ControlChannelHandle::new(conn, service_config);
+        let handle =
+            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval);
 
         // Insert the new handle
         let _ = h.insert(service_digest, session_key, handle);
@@ -371,7 +399,11 @@ where
     // Create a control channel handle, where the control channel handling task
     // and the connection pool task are created.
     #[instrument(name = "handle", skip_all, fields(service = %service.name))]
-    fn new(conn: T::Stream, service: ServerServiceConfig) -> ControlChannelHandle<T> {
+    fn new(
+        conn: T::Stream,
+        service: ServerServiceConfig,
+        heartbeat_interval: u64,
+    ) -> ControlChannelHandle<T> {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
 
@@ -435,6 +467,7 @@ where
             conn,
             shutdown_rx,
             data_ch_req_rx,
+            heartbeat_interval,
         };
 
         // Run the control channel
@@ -460,13 +493,21 @@ struct ControlChannel<T: Transport> {
     conn: T::Stream,                               // The connection of control channel
     shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
     data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
+    heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
 }
 
 impl<T: Transport> ControlChannel<T> {
+    async fn write_and_flush(&mut self, data: &[u8]) -> Result<()> {
+        write_and_flush(&mut self.conn, data)
+            .await
+            .with_context(|| "Failed to write control cmds")?;
+        Ok(())
+    }
     // Run a control channel
     #[instrument(skip_all)]
     async fn run(mut self) -> Result<()> {
-        let cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel).unwrap();
+        let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel).unwrap();
+        let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat).unwrap();
 
         // Wait for data channel requests and the shutdown signal
         loop {
@@ -474,11 +515,7 @@ impl<T: Transport> ControlChannel<T> {
                 val = self.data_ch_req_rx.recv() => {
                     match val {
                         Some(_) => {
-                            if let Err(e) = self.conn.write_all(&cmd).await.with_context(||"Failed to write control cmds") {
-                                error!("{:#}", e);
-                                break;
-                            }
-                            if let Err(e) = self.conn.flush().await.with_context(|| "Failed to flush control cmds") {
+                            if let Err(e) = self.write_and_flush(&create_ch_cmd).await {
                                 error!("{:#}", e);
                                 break;
                             }
@@ -488,6 +525,12 @@ impl<T: Transport> ControlChannel<T> {
                         }
                     }
                 },
+                _ = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
+                            if let Err(e) = self.write_and_flush(&heartbeat).await {
+                                error!("{:#}", e);
+                                break;
+                            }
+                }
                 // Wait for the shutdown signal
                 _ = self.shutdown_rx.recv() => {
                     break;
@@ -592,7 +635,7 @@ async fn run_tcp_connection_pool<T: Transport>(
     'pool: while let Some(mut visitor) = visitor_rx.recv().await {
         loop {
             if let Some(mut ch) = data_ch_rx.recv().await {
-                if ch.write_all(&cmd).await.is_ok() {
+                if write_and_flush(&mut ch, &cmd).await.is_ok() {
                     tokio::spawn(async move {
                         let _ = copy_bidirectional(&mut ch, &mut visitor).await;
                     });
@@ -641,8 +684,8 @@ async fn run_udp_connection_pool<T: Transport>(
     let mut conn = data_ch_rx
         .recv()
         .await
-        .ok_or(anyhow!("No available data channels"))?;
-    conn.write_all(&cmd).await?;
+        .ok_or_else(|| anyhow!("No available data channels"))?;
+    write_and_flush(&mut conn, &cmd).await?;
 
     let mut buf = [0u8; UDP_BUFFER_SIZE];
     loop {

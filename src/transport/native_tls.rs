@@ -1,13 +1,14 @@
-use std::net::SocketAddr;
-
-use super::{SocketOpts, TcpTransport, Transport};
 use crate::config::{TlsConfig, TransportConfig};
+use crate::helper::host_port_pair;
+use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use std::fs;
+use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_native_tls::native_tls::{self, Certificate, Identity};
-use tokio_native_tls::{TlsAcceptor, TlsConnector, TlsStream};
+pub(crate) use tokio_native_tls::TlsStream;
+use tokio_native_tls::{TlsAcceptor, TlsConnector};
 
 #[derive(Debug)]
 pub struct TlsTransport {
@@ -25,7 +26,10 @@ impl Transport for TlsTransport {
 
     fn new(config: &TransportConfig) -> Result<Self> {
         let tcp = TcpTransport::new(config)?;
-        let config = config.tls.as_ref().ok_or(anyhow!("Missing tls config"))?;
+        let config = config
+            .tls
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing tls config"))?;
 
         let connector = match config.trusted_root.as_ref() {
             Some(path) => {
@@ -38,7 +42,11 @@ impl Transport for TlsTransport {
                     .build()?;
                 Some(TlsConnector::from(connector))
             }
-            None => None,
+            None => {
+                // if no trusted_root is specified, allow TlsConnector to use system default
+                let connector = native_tls::TlsConnector::builder().build()?;
+                Some(TlsConnector::from(connector))
+            }
         };
 
         let tls_acceptor = match config.pkcs12.as_ref() {
@@ -86,7 +94,7 @@ impl Transport for TlsTransport {
         Ok(conn)
     }
 
-    async fn connect(&self, addr: &str) -> Result<Self::Stream> {
+    async fn connect(&self, addr: &AddrMaybeCached) -> Result<Self::Stream> {
         let conn = self.tcp.connect(addr).await?;
 
         let connector = self.connector.as_ref().unwrap();
@@ -94,10 +102,15 @@ impl Transport for TlsTransport {
             .connect(
                 self.config
                     .hostname
-                    .as_ref()
-                    .unwrap_or(&String::from(addr.split(':').next().unwrap())),
+                    .as_deref()
+                    .unwrap_or(host_port_pair(&addr.addr)?.0),
                 conn,
             )
             .await?)
     }
+}
+
+#[cfg(feature = "websocket-native-tls")]
+pub(crate) fn get_tcpstream(s: &TlsStream<TcpStream>) -> &TcpStream {
+    s.get_ref().get_ref().get_ref()
 }

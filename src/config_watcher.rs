@@ -5,6 +5,7 @@ use crate::{
 use anyhow::{Context, Result};
 use std::{
     collections::HashMap,
+    env,
     path::{Path, PathBuf},
 };
 use tokio::sync::{broadcast, mpsc};
@@ -13,36 +14,30 @@ use tracing::{error, info, instrument};
 #[cfg(feature = "notify")]
 use notify::{EventKind, RecursiveMode, Watcher};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ConfigChange {
     General(Box<Config>), // Trigger a full restart
-    ServiceChange(ServiceChange),
+    ServerChange(ServerServiceChange),
+    ClientChange(ClientServiceChange),
 }
 
-#[derive(Debug, PartialEq)]
-pub enum ServiceChange {
-    ClientAdd(ClientServiceConfig),
-    ClientDelete(String),
-    ServerAdd(ServerServiceConfig),
-    ServerDelete(String),
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum ClientServiceChange {
+    Add(ClientServiceConfig),
+    Delete(String),
 }
 
-impl From<ClientServiceConfig> for ServiceChange {
-    fn from(c: ClientServiceConfig) -> Self {
-        ServiceChange::ClientAdd(c)
-    }
-}
-
-impl From<ServerServiceConfig> for ServiceChange {
-    fn from(c: ServerServiceConfig) -> Self {
-        ServiceChange::ServerAdd(c)
-    }
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum ServerServiceChange {
+    Add(ServerServiceConfig),
+    Delete(String),
 }
 
 trait InstanceConfig: Clone {
-    type ServiceConfig: Into<ServiceChange> + PartialEq + Clone;
+    type ServiceConfig: PartialEq + Eq + Clone;
     fn equal_without_service(&self, rhs: &Self) -> bool;
-    fn to_service_change_delete(s: String) -> ServiceChange;
+    fn service_delete_change(s: String) -> ConfigChange;
+    fn service_add_change(cfg: Self::ServiceConfig) -> ConfigChange;
     fn get_services(&self) -> &HashMap<String, Self::ServiceConfig>;
 }
 
@@ -61,8 +56,11 @@ impl InstanceConfig for ServerConfig {
 
         left == right
     }
-    fn to_service_change_delete(s: String) -> ServiceChange {
-        ServiceChange::ServerDelete(s)
+    fn service_delete_change(s: String) -> ConfigChange {
+        ConfigChange::ServerChange(ServerServiceChange::Delete(s))
+    }
+    fn service_add_change(cfg: Self::ServiceConfig) -> ConfigChange {
+        ConfigChange::ServerChange(ServerServiceChange::Add(cfg))
     }
     fn get_services(&self) -> &HashMap<String, Self::ServiceConfig> {
         &self.services
@@ -84,8 +82,11 @@ impl InstanceConfig for ClientConfig {
 
         left == right
     }
-    fn to_service_change_delete(s: String) -> ServiceChange {
-        ServiceChange::ClientDelete(s)
+    fn service_delete_change(s: String) -> ConfigChange {
+        ConfigChange::ClientChange(ClientServiceChange::Delete(s))
+    }
+    fn service_add_change(cfg: Self::ServiceConfig) -> ConfigChange {
+        ConfigChange::ClientChange(ClientServiceChange::Add(cfg))
     }
     fn get_services(&self) -> &HashMap<String, Self::ServiceConfig> {
         &self.services
@@ -139,6 +140,11 @@ async fn config_watcher(
     mut old: Config,
 ) -> Result<()> {
     let (fevent_tx, mut fevent_rx) = mpsc::unbounded_channel();
+    let path = if path.is_absolute() {
+        path
+    } else {
+        env::current_dir()?.join(path)
+    };
     let parent_path = path.parent().expect("config file should have a parent dir");
     let path_clone = path.clone();
     let mut watcher =
@@ -174,8 +180,9 @@ async fn config_watcher(
                       }
                     };
 
-                    for event in calculate_events(&old, &new) {
-                      event_tx.send(event)?;
+                    let events = calculate_events(&old, &new).into_iter().flatten();
+                    for event in events {
+                        event_tx.send(event)?;
                     }
 
                     old = new;
@@ -192,42 +199,40 @@ async fn config_watcher(
     Ok(())
 }
 
-fn calculate_events(old: &Config, new: &Config) -> Vec<ConfigChange> {
+fn calculate_events(old: &Config, new: &Config) -> Option<Vec<ConfigChange>> {
     if old == new {
-        return vec![];
+        return None;
+    }
+
+    if (old.server.is_some() != new.server.is_some())
+        || (old.client.is_some() != new.client.is_some())
+    {
+        return Some(vec![ConfigChange::General(Box::new(new.clone()))]);
     }
 
     let mut ret = vec![];
 
     if old.server != new.server {
-        if old.server.is_some() != new.server.is_some() {
-            return vec![ConfigChange::General(Box::new(new.clone()))];
-        } else {
-            match calculate_instance_config_events(
-                old.server.as_ref().unwrap(),
-                new.server.as_ref().unwrap(),
-            ) {
-                Some(mut v) => ret.append(&mut v),
-                None => return vec![ConfigChange::General(Box::new(new.clone()))],
-            }
+        match calculate_instance_config_events(
+            old.server.as_ref().unwrap(),
+            new.server.as_ref().unwrap(),
+        ) {
+            Some(mut v) => ret.append(&mut v),
+            None => return Some(vec![ConfigChange::General(Box::new(new.clone()))]),
         }
     }
 
     if old.client != new.client {
-        if old.client.is_some() != new.client.is_some() {
-            return vec![ConfigChange::General(Box::new(new.clone()))];
-        } else {
-            match calculate_instance_config_events(
-                old.client.as_ref().unwrap(),
-                new.client.as_ref().unwrap(),
-            ) {
-                Some(mut v) => ret.append(&mut v),
-                None => return vec![ConfigChange::General(Box::new(new.clone()))],
-            }
+        match calculate_instance_config_events(
+            old.client.as_ref().unwrap(),
+            new.client.as_ref().unwrap(),
+        ) {
+            Some(mut v) => ret.append(&mut v),
+            None => return Some(vec![ConfigChange::General(Box::new(new.clone()))]),
         }
     }
 
-    ret
+    Some(ret)
 }
 
 // None indicates a General change needed
@@ -242,31 +247,17 @@ fn calculate_instance_config_events<T: InstanceConfig>(
     let old = old.get_services();
     let new = new.get_services();
 
-    let mut v = vec![];
-    v.append(&mut calculate_service_delete_events::<T>(old, new));
-    v.append(&mut calculate_service_add_events(old, new));
-
-    Some(v.into_iter().map(ConfigChange::ServiceChange).collect())
-}
-
-fn calculate_service_delete_events<T: InstanceConfig>(
-    old: &HashMap<String, T::ServiceConfig>,
-    new: &HashMap<String, T::ServiceConfig>,
-) -> Vec<ServiceChange> {
-    old.keys()
+    let deletions = old
+        .keys()
         .filter(|&name| new.get(name).is_none())
-        .map(|x| T::to_service_change_delete(x.to_owned()))
-        .collect()
-}
+        .map(|x| T::service_delete_change(x.to_owned()));
 
-fn calculate_service_add_events<T: PartialEq + Clone + Into<ServiceChange>>(
-    old: &HashMap<String, T>,
-    new: &HashMap<String, T>,
-) -> Vec<ServiceChange> {
-    new.iter()
+    let addition = new
+        .iter()
         .filter(|(name, c)| old.get(*name) != Some(*c))
-        .map(|(_, c)| c.clone().into())
-        .collect()
+        .map(|(_, c)| T::service_add_change(c.clone()));
+
+    Some(deletions.chain(addition).collect())
 }
 
 #[cfg(test)]
@@ -372,23 +363,23 @@ mod test {
         let mut expected = [
             vec![ConfigChange::General(Box::new(tests[0].new.clone()))],
             vec![ConfigChange::General(Box::new(tests[1].new.clone()))],
-            vec![ConfigChange::ServiceChange(ServiceChange::ServerAdd(
+            vec![ConfigChange::ServerChange(ServerServiceChange::Add(
                 Default::default(),
             ))],
-            vec![ConfigChange::ServiceChange(ServiceChange::ServerDelete(
+            vec![ConfigChange::ServerChange(ServerServiceChange::Delete(
                 String::from("foo"),
             ))],
             vec![
-                ConfigChange::ServiceChange(ServiceChange::ServerDelete(String::from("foo1"))),
-                ConfigChange::ServiceChange(ServiceChange::ServerAdd(
+                ConfigChange::ServerChange(ServerServiceChange::Delete(String::from("foo1"))),
+                ConfigChange::ServerChange(ServerServiceChange::Add(
                     tests[4].new.server.as_ref().unwrap().services["bar1"].clone(),
                 )),
-                ConfigChange::ServiceChange(ServiceChange::ClientDelete(String::from("foo1"))),
-                ConfigChange::ServiceChange(ServiceChange::ClientDelete(String::from("foo2"))),
-                ConfigChange::ServiceChange(ServiceChange::ClientAdd(
+                ConfigChange::ClientChange(ClientServiceChange::Delete(String::from("foo1"))),
+                ConfigChange::ClientChange(ClientServiceChange::Delete(String::from("foo2"))),
+                ConfigChange::ClientChange(ClientServiceChange::Add(
                     tests[4].new.client.as_ref().unwrap().services["bar1"].clone(),
                 )),
-                ConfigChange::ServiceChange(ServiceChange::ClientAdd(
+                ConfigChange::ClientChange(ClientServiceChange::Add(
                     tests[4].new.client.as_ref().unwrap().services["bar2"].clone(),
                 )),
             ],
@@ -397,16 +388,18 @@ mod test {
         assert_eq!(tests.len(), expected.len());
 
         for i in 0..tests.len() {
-            let mut actual = calculate_events(&tests[i].old, &tests[i].new);
+            let mut actual = calculate_events(&tests[i].old, &tests[i].new).unwrap();
 
             let get_key = |x: &ConfigChange| -> String {
                 match x {
                     ConfigChange::General(_) => String::from("g"),
-                    ConfigChange::ServiceChange(sc) => match sc {
-                        ServiceChange::ClientAdd(c) => "c_add_".to_owned() + &c.name,
-                        ServiceChange::ClientDelete(s) => "c_del_".to_owned() + s,
-                        ServiceChange::ServerAdd(c) => "s_add_".to_owned() + &c.name,
-                        ServiceChange::ServerDelete(s) => "s_del_".to_owned() + s,
+                    ConfigChange::ServerChange(sc) => match sc {
+                        ServerServiceChange::Add(c) => "s_add_".to_owned() + &c.name,
+                        ServerServiceChange::Delete(s) => "s_del_".to_owned() + s,
+                    },
+                    ConfigChange::ClientChange(sc) => match sc {
+                        ClientServiceChange::Add(c) => "c_add_".to_owned() + &c.name,
+                        ClientServiceChange::Delete(s) => "c_del_".to_owned() + s,
                     },
                 }
             };
@@ -416,5 +409,20 @@ mod test {
 
             assert_eq!(actual, expected[i]);
         }
+
+        // No changes
+        assert_eq!(
+            calculate_events(
+                &Config {
+                    server: Default::default(),
+                    client: None,
+                },
+                &Config {
+                    server: Default::default(),
+                    client: None,
+                },
+            ),
+            None
+        );
     }
 }

@@ -1,15 +1,16 @@
 use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType};
-use crate::config_watcher::ServiceChange;
+use crate::config_watcher::{ClientServiceChange, ConfigChange};
 use crate::helper::udp_connect;
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
     self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
     DataChannelCmd, UdpTraffic, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES,
 };
-use crate::transport::{SocketOpts, TcpTransport, Transport};
+use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
+use backoff::backoff::Backoff;
+use backoff::future::retry_notify;
 use backoff::ExponentialBackoff;
-use backoff::{backoff::Backoff, future::retry_notify};
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -22,43 +23,56 @@ use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
 
 #[cfg(feature = "noise")]
 use crate::transport::NoiseTransport;
-#[cfg(feature = "tls")]
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
 use crate::transport::TlsTransport;
+#[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+use crate::transport::WebsocketTransport;
 
 use crate::constants::{run_control_chan_backoff, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT};
 
 // The entrypoint of running a client
 pub async fn run_client(
-    config: &Config,
+    config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
-    service_rx: mpsc::Receiver<ServiceChange>,
+    update_rx: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
-    let config = config.client.as_ref().ok_or(anyhow!(
+    let config = config.client.ok_or_else(|| {
+        anyhow!(
         "Try to run as a client, but the configuration is missing. Please add the `[client]` block"
-    ))?;
+    )
+    })?;
 
     match config.transport.transport_type {
         TransportType::Tcp => {
             let mut client = Client::<TcpTransport>::from(config).await?;
-            client.run(shutdown_rx, service_rx).await
+            client.run(shutdown_rx, update_rx).await
         }
         TransportType::Tls => {
-            #[cfg(feature = "tls")]
+            #[cfg(any(feature = "native-tls", feature = "rustls"))]
             {
                 let mut client = Client::<TlsTransport>::from(config).await?;
-                client.run(shutdown_rx, service_rx).await
+                client.run(shutdown_rx, update_rx).await
             }
-            #[cfg(not(feature = "tls"))]
-            crate::helper::feature_not_compile("tls")
+            #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
+            crate::helper::feature_neither_compile("native-tls", "rustls")
         }
         TransportType::Noise => {
             #[cfg(feature = "noise")]
             {
                 let mut client = Client::<NoiseTransport>::from(config).await?;
-                client.run(shutdown_rx, service_rx).await
+                client.run(shutdown_rx, update_rx).await
             }
             #[cfg(not(feature = "noise"))]
             crate::helper::feature_not_compile("noise")
+        }
+        TransportType::Websocket => {
+            #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+            {
+                let mut client = Client::<WebsocketTransport>::from(config).await?;
+                client.run(shutdown_rx, update_rx).await
+            }
+            #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
+            crate::helper::feature_neither_compile("websocket-native-tls", "websocket-rustls")
         }
     }
 }
@@ -67,21 +81,21 @@ type ServiceDigest = protocol::Digest;
 type Nonce = protocol::Digest;
 
 // Holds the state of a client
-struct Client<'a, T: Transport> {
-    config: &'a ClientConfig,
+struct Client<T: Transport> {
+    config: ClientConfig,
     service_handles: HashMap<String, ControlChannelHandle>,
     transport: Arc<T>,
 }
 
-impl<'a, T: 'static + Transport> Client<'a, T> {
+impl<T: 'static + Transport> Client<T> {
     // Create a Client from `[client]` config block
-    async fn from(config: &'a ClientConfig) -> Result<Client<'a, T>> {
+    async fn from(config: ClientConfig) -> Result<Client<T>> {
+        let transport =
+            Arc::new(T::new(&config.transport).with_context(|| "Failed to create the transport")?);
         Ok(Client {
             config,
             service_handles: HashMap::new(),
-            transport: Arc::new(
-                T::new(&config.transport).with_context(|| "Failed to create the transport")?,
-            ),
+            transport,
         })
     }
 
@@ -89,7 +103,7 @@ impl<'a, T: 'static + Transport> Client<'a, T> {
     async fn run(
         &mut self,
         mut shutdown_rx: broadcast::Receiver<bool>,
-        mut service_rx: mpsc::Receiver<ServiceChange>,
+        mut update_rx: mpsc::Receiver<ConfigChange>,
     ) -> Result<()> {
         for (name, config) in &self.config.services {
             // Create a control channel for each service defined
@@ -97,6 +111,7 @@ impl<'a, T: 'static + Transport> Client<'a, T> {
                 (*config).clone(),
                 self.config.remote_addr.clone(),
                 self.transport.clone(),
+                self.config.heartbeat_timeout,
             );
             self.service_handles.insert(name.clone(), handle);
         }
@@ -113,23 +128,9 @@ impl<'a, T: 'static + Transport> Client<'a, T> {
                     }
                     break;
                 },
-                e = service_rx.recv() => {
+                e = update_rx.recv() => {
                     if let Some(e) = e {
-                        match e {
-                            ServiceChange::ClientAdd(s)=> {
-                                let name = s.name.clone();
-                                let handle = ControlChannelHandle::new(
-                                    s,
-                                    self.config.remote_addr.clone(),
-                                    self.transport.clone(),
-                                );
-                                let _ = self.service_handles.insert(name, handle);
-                            },
-                            ServiceChange::ClientDelete(s)=> {
-                                let _ = self.service_handles.remove(&s);
-                            },
-                            _ => ()
-                        }
+                        self.handle_hot_reload(e).await;
                     }
                 }
             }
@@ -142,11 +143,32 @@ impl<'a, T: 'static + Transport> Client<'a, T> {
 
         Ok(())
     }
+
+    async fn handle_hot_reload(&mut self, e: ConfigChange) {
+        match e {
+            ConfigChange::ClientChange(client_change) => match client_change {
+                ClientServiceChange::Add(cfg) => {
+                    let name = cfg.name.clone();
+                    let handle = ControlChannelHandle::new(
+                        cfg,
+                        self.config.remote_addr.clone(),
+                        self.transport.clone(),
+                        self.config.heartbeat_timeout,
+                    );
+                    let _ = self.service_handles.insert(name, handle);
+                }
+                ClientServiceChange::Delete(s) => {
+                    let _ = self.service_handles.remove(&s);
+                }
+            },
+            ignored => warn!("Ignored {:?} since running as a client", ignored),
+        }
+    }
 }
 
 struct RunDataChannelArgs<T: Transport> {
     session_key: Nonce,
-    remote_addr: String,
+    remote_addr: AddrMaybeCached,
     connector: Arc<T>,
     socket_opts: SocketOpts,
     service: ClientServiceConfig,
@@ -369,6 +391,7 @@ struct ControlChannel<T: Transport> {
     shutdown_rx: oneshot::Receiver<u8>, // Receives the shutdown signal
     remote_addr: String,                // `client.remote_addr`
     transport: Arc<T>,                  // Wrapper around the transport layer
+    heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
 }
 
 // Handle of a control channel
@@ -380,9 +403,12 @@ struct ControlChannelHandle {
 impl<T: 'static + Transport> ControlChannel<T> {
     #[instrument(skip_all)]
     async fn run(&mut self) -> Result<()> {
+        let mut remote_addr = AddrMaybeCached::new(&self.remote_addr);
+        remote_addr.resolve().await?;
+
         let mut conn = self
             .transport
-            .connect(&self.remote_addr)
+            .connect(&remote_addr)
             .await
             .with_context(|| format!("Failed to connect to {}", &self.remote_addr))?;
         T::hint(&conn, SocketOpts::for_control_channel());
@@ -427,7 +453,6 @@ impl<T: 'static + Transport> ControlChannel<T> {
         // Channel ready
         info!("Control channel established");
 
-        let remote_addr = self.remote_addr.clone();
         // Socket options for the data channel
         let socket_opts = SocketOpts::from_client_cfg(&self.service);
         let data_ch_args = Arc::new(RunDataChannelArgs {
@@ -451,9 +476,13 @@ impl<T: 'static + Transport> ControlChannel<T> {
                                     warn!("{:#}", e);
                                 }
                             }.instrument(Span::current()));
-                        }
+                        },
+                        ControlChannelCmd::HeartBeat => ()
                     }
                 },
+                _ = time::sleep(Duration::from_secs(self.heartbeat_timeout)), if self.heartbeat_timeout != 0 => {
+                    return Err(anyhow!("Heartbeat timed out"))
+                }
                 _ = &mut self.shutdown_rx => {
                     break;
                 }
@@ -471,22 +500,26 @@ impl ControlChannelHandle {
         service: ClientServiceConfig,
         remote_addr: String,
         transport: Arc<T>,
+        heartbeat_timeout: u64,
     ) -> ControlChannelHandle {
         let digest = protocol::digest(service.name.as_bytes());
 
         info!("Starting {}", hex::encode(digest));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let mut retry_backoff = run_control_chan_backoff(service.retry_interval.unwrap());
+
         let mut s = ControlChannel {
             digest,
             service,
             shutdown_rx,
             remote_addr,
             transport,
+            heartbeat_timeout,
         };
 
         tokio::spawn(
             async move {
-                let mut backoff = run_control_chan_backoff();
                 let mut start = Instant::now();
 
                 while let Err(err) = s
@@ -500,10 +533,10 @@ impl ControlChannelHandle {
 
                     if start.elapsed() > Duration::from_secs(3) {
                         // The client runs for at least 3 secs and then disconnects
-                        // Retry immediately
-                        backoff.reset();
-                        error!("{:#}. Retry...", err);
-                    } else if let Some(duration) = backoff.next_backoff() {
+                        retry_backoff.reset();
+                    }
+
+                    if let Some(duration) = retry_backoff.next_backoff() {
                         error!("{:#}. Retry in {:?}...", err, duration);
                         time::sleep(duration).await;
                     } else {
